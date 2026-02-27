@@ -1,0 +1,939 @@
+#!/usr/bin/env python3
+"""
+🚀 TVA TELEGRAM BOT - GOD LEVEL
+Owner: 5583480074
+API: 8208248735:AAFbn3QvXhaLKC39bHrTITHwmKLCz2zPFX8"""
+
+import logging
+import sys
+import traceback
+from datetime import datetime
+import os
+import time
+import threading
+import sqlite3
+import json
+import hashlib
+import random
+import string
+
+# Railway specific imports
+import flask
+from flask import Flask, jsonify
+
+# Telegram imports
+import telebot
+from telebot import types
+
+# ==================== CONFIGURATION ====================
+class Config:
+    """Bot configuration"""
+    BOT_TOKEN = "8202763008:AAEHlK1PG0x-rh0WeexxajI1JcC5_SsRQgA"
+    OWNER_ID = 5583480074
+    ADMIN_ID = 7328615655
+    
+    # Railway specific paths
+    DATABASE_PATH = os.path.join(os.path.dirname(__file__), "tva_bot.db")
+    LOG_FILE = os.path.join(os.path.dirname(__file__), "bot_logs.log")
+    
+    # Bot settings
+    AUTO_BACKUP_INTERVAL = 3600  # seconds
+    RATE_LIMIT_WINDOW = 60  # seconds
+    MAX_REQUESTS_PER_WINDOW = 30
+    
+    # Railway settings
+    PORT = int(os.environ.get('PORT', 8080))
+    HOST = '0.0.0.0'
+
+# ==================== LOGGING SETUP ====================
+def setup_logger():
+    """Setup logging"""
+    logger = logging.getLogger(__name__)
+    logger.setLevel(logging.INFO)
+    
+    # Create formatter
+    formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    
+    # File handler with proper path
+    try:
+        file_handler = logging.FileHandler(Config.LOG_FILE, encoding='utf-8')
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+    except:
+        pass  # Skip file logging if permission issues
+    
+    # Console handler
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(formatter)
+    
+    # Add handlers
+    logger.addHandler(console_handler)
+    
+    return logger
+
+logger = setup_logger()
+
+# ==================== DATABASE MANAGER ====================
+class DatabaseManager:
+    """Database manager"""
+    
+    def __init__(self):
+        self.connection = None
+        self.lock = threading.Lock()
+        self.init_db()
+    
+    def init_db(self):
+        """Initialize database"""
+        try:
+            with self.lock:
+                self.connection = sqlite3.connect(Config.DATABASE_PATH, check_same_thread=False, timeout=10)
+                cursor = self.connection.cursor()
+                
+                # Enable WAL mode for better concurrency
+                cursor.execute('PRAGMA journal_mode=WAL')
+                cursor.execute('PRAGMA synchronous=NORMAL')
+                
+                # Users table
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS users (
+                        user_id INTEGER PRIMARY KEY,
+                        username TEXT,
+                        first_name TEXT,
+                        last_name TEXT,
+                        join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        is_banned INTEGER DEFAULT 0,
+                        is_admin INTEGER DEFAULT 0,
+                        warns INTEGER DEFAULT 0,
+                        messages INTEGER DEFAULT 0,
+                        last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
+                
+                # Insert owner as admin
+                cursor.execute('''
+                    INSERT OR IGNORE INTO users 
+                    (user_id, username, first_name, is_admin) 
+                    VALUES (?, ?, ?, 1)
+                ''', (Config.OWNER_ID, 'Owner', 'TVA Owner'))
+                
+                # Insert admin
+                cursor.execute('''
+                    INSERT OR IGNORE INTO users 
+                    (user_id, username, first_name, is_admin) 
+                    VALUES (?, ?, ?, 1)
+                ''', (Config.ADMIN_ID, 'Admin', 'TVA Admin'))
+                
+                # Admin logs
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS admin_logs (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        admin_id INTEGER,
+                        action TEXT,
+                        target_id INTEGER,
+                        reason TEXT,
+                        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
+                
+                # Rate limits
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS rate_limits (
+                        user_id INTEGER,
+                        command TEXT,
+                        timestamp REAL
+                    )
+                ''')
+                
+                self.connection.commit()
+                logger.info(f"✅ Database initialized at {Config.DATABASE_PATH}")
+                
+        except Exception as e:
+            logger.error(f"❌ Database error: {e}")
+    
+    def execute(self, query, params=(), fetch=False, fetchone=False):
+        """Execute query with retry logic"""
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                with self.lock:
+                    cursor = self.connection.cursor()
+                    cursor.execute(query, params)
+                    
+                    if fetch:
+                        result = cursor.fetchall()
+                    elif fetchone:
+                        result = cursor.fetchone()
+                    else:
+                        result = cursor.lastrowid
+                    
+                    self.connection.commit()
+                    return result
+            except sqlite3.OperationalError as e:
+                if "database is locked" in str(e) and attempt < max_retries - 1:
+                    time.sleep(0.1)
+                    continue
+                logger.error(f"Query error: {e}")
+                return None
+            except Exception as e:
+                logger.error(f"Query error: {e}")
+                return None
+
+# ==================== SECURITY ====================
+class Security:
+    """Security manager"""
+    
+    def __init__(self, db):
+        self.db = db
+        self.banned = set()
+        self.load_banned()
+    
+    def load_banned(self):
+        """Load banned users"""
+        try:
+            users = self.db.execute(
+                "SELECT user_id FROM users WHERE is_banned = 1",
+                fetch=True
+            )
+            if users:
+                self.banned = {u[0] for u in users}
+        except:
+            self.banned = set()
+    
+    def is_banned(self, user_id):
+        """Check if user is banned"""
+        return user_id in self.banned
+    
+    def check_rate(self, user_id, command="msg"):
+        """Check rate limit"""
+        current = time.time()
+        window = current - Config.RATE_LIMIT_WINDOW
+        
+        # Clean old
+        self.db.execute(
+            "DELETE FROM rate_limits WHERE timestamp < ?",
+            (window,)
+        )
+        
+        # Count
+        count = self.db.execute(
+            "SELECT COUNT(*) FROM rate_limits WHERE user_id = ? AND command = ? AND timestamp >= ?",
+            (user_id, command, window),
+            fetchone=True
+        )
+        
+        current_count = count[0] if count else 0
+        
+        if current_count >= Config.MAX_REQUESTS_PER_WINDOW:
+            return False
+        
+        # Log
+        self.db.execute(
+            "INSERT INTO rate_limits (user_id, command, timestamp) VALUES (?, ?, ?)",
+            (user_id, command, current)
+        )
+        
+        return True
+
+# ==================== USER MANAGER ====================
+class UserManager:
+    """User manager"""
+    
+    def __init__(self, db):
+        self.db = db
+    
+    def register(self, user_id, username, first_name, last_name=""):
+        """Register user"""
+        self.db.execute(
+            '''INSERT OR IGNORE INTO users 
+               (user_id, username, first_name, last_name) 
+               VALUES (?, ?, ?, ?)''',
+            (user_id, username, first_name, last_name)
+        )
+    
+    def get_user(self, user_id):
+        """Get user info"""
+        return self.db.execute(
+            "SELECT * FROM users WHERE user_id = ?",
+            (user_id,),
+            fetchone=True
+        )
+    
+    def get_all(self):
+        """Get all users"""
+        return self.db.execute(
+            "SELECT user_id, username, first_name, join_date, is_banned FROM users",
+            fetch=True
+        )
+    
+    def count(self):
+        """Count users"""
+        result = self.db.execute(
+            "SELECT COUNT(*) FROM users",
+            fetchone=True
+        )
+        return result[0] if result else 0
+    
+    def update_stats(self, user_id):
+        """Update user stats"""
+        self.db.execute(
+            "UPDATE users SET messages = messages + 1, last_seen = CURRENT_TIMESTAMP WHERE user_id = ?",
+            (user_id,)
+        )
+
+# ==================== ADMIN MANAGER ====================
+class AdminManager:
+    """Admin manager"""
+    
+    def __init__(self, db):
+        self.db = db
+    
+    def is_admin(self, user_id):
+        """Check if admin"""
+        user = self.db.execute(
+            "SELECT is_admin FROM users WHERE user_id = ?",
+            (user_id,),
+            fetchone=True
+        )
+        return user and user[0] == 1
+    
+    def is_owner(self, user_id):
+        """Check if owner"""
+        return user_id == Config.OWNER_ID
+    
+    def log_action(self, admin_id, action, target_id=None, reason=""):
+        """Log admin action"""
+        self.db.execute(
+            '''INSERT INTO admin_logs 
+               (admin_id, action, target_id, reason) 
+               VALUES (?, ?, ?, ?)''',
+            (admin_id, action, target_id, reason)
+        )
+    
+    def ban_user(self, admin_id, target_id, reason=""):
+        """Ban user"""
+        if target_id == Config.OWNER_ID:
+            return False, "Cannot ban owner"
+        
+        self.db.execute(
+            "UPDATE users SET is_banned = 1 WHERE user_id = ?",
+            (target_id,)
+        )
+        
+        self.log_action(admin_id, "BAN", target_id, reason)
+        return True, f"User {target_id} banned"
+    
+    def unban_user(self, admin_id, target_id):
+        """Unban user"""
+        self.db.execute(
+            "UPDATE users SET is_banned = 0 WHERE user_id = ?",
+            (target_id,)
+        )
+        
+        self.log_action(admin_id, "UNBAN", target_id, "Unbanned")
+        return True, f"User {target_id} unbanned"
+    
+    def warn_user(self, admin_id, target_id, reason=""):
+        """Warn user"""
+        # Get current warns
+        user = self.db.execute(
+            "SELECT warns FROM users WHERE user_id = ?",
+            (target_id,),
+            fetchone=True
+        )
+        
+        warns = user[0] + 1 if user else 1
+        
+        self.db.execute(
+            "UPDATE users SET warns = ? WHERE user_id = ?",
+            (warns, target_id)
+        )
+        
+        self.log_action(admin_id, "WARN", target_id, f"Warning {warns}/3: {reason}")
+        
+        if warns >= 3:
+            self.ban_user(admin_id, target_id, "3 warnings")
+            return True, f"User {target_id} warned ({warns}/3) and banned"
+        
+        return True, f"User {target_id} warned ({warns}/3)"
+
+# ==================== UTILITIES ====================
+class Utilities:
+    """Utility functions"""
+    
+    @staticmethod
+    def generate_id(length=8):
+        """Generate random ID"""
+        chars = string.ascii_letters + string.digits
+        return ''.join(random.choice(chars) for _ in range(length))
+    
+    @staticmethod
+    def format_time(seconds):
+        """Format seconds"""
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        seconds = int(seconds % 60)
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+    
+    @staticmethod
+    def get_file_size(filepath):
+        """Get file size"""
+        try:
+            size = os.path.getsize(filepath)
+            for unit in ['B', 'KB', 'MB', 'GB']:
+                if size < 1024.0:
+                    return f"{size:.2f} {unit}"
+                size /= 1024.0
+            return f"{size:.2f} TB"
+        except:
+            return "0 B"
+
+# ==================== RAILWAY WEB SERVER ====================
+app = Flask(__name__)
+bot_instance = None
+
+@app.route('/')
+def home():
+    return jsonify({
+        'status': 'online',
+        'bot': 'TVA Telegram Bot',
+        'time': datetime.now().isoformat()
+    })
+
+@app.route('/health')
+def health():
+    return jsonify({'status': 'healthy'}), 200
+
+def run_web_server():
+    """Run Flask web server for Railway"""
+    app.run(host=Config.HOST, port=Config.PORT)
+
+# ==================== MAIN BOT ====================
+class TVABot:
+    """Main bot class"""
+    
+    def __init__(self):
+        self.bot = None
+        self.db = DatabaseManager()
+        self.security = Security(self.db)
+        self.users = UserManager(self.db)
+        self.admin = AdminManager(self.db)
+        self.utils = Utilities()
+        self.start_time = time.time()
+        self.running = True
+        self.setup()
+    
+    def setup(self):
+        """Setup bot"""
+        try:
+            self.bot = telebot.TeleBot(Config.BOT_TOKEN)
+            self.setup_handlers()
+            logger.info("✅ Bot setup complete")
+        except Exception as e:
+            logger.error(f"❌ Setup failed: {e}")
+            raise
+    
+    def setup_handlers(self):
+        """Setup command handlers"""
+        
+        # ========== START ==========
+        @self.bot.message_handler(commands=['start'])
+        def start_cmd(message):
+            user_id = message.from_user.id
+            username = message.from_user.username or "NoUsername"
+            first_name = message.from_user.first_name or "User"
+            last_name = message.from_user.last_name or ""
+            
+            # Register user
+            self.users.register(user_id, username, first_name, last_name)
+            
+            # Welcome message
+            welcome = f"""
+🎮 *Welcome to TVA Bot!* 🃏
+
+*👤 User ID:* `{user_id}`
+*📛 Name:* {first_name} {last_name}
+*👑 Owner:* `{Config.OWNER_ID}`
+*⭐ Admin:* `{Config.ADMIN_ID}`
+
+*📚 Commands:*
+/help - Show all commands
+/profile - Your profile
+/stats - Bot statistics
+/id - Get your ID
+/ping - Check latency
+
+*💡 Status:* ✅ Online
+*🚀 Version:* 2.0.0
+            """
+            
+            self.bot.reply_to(message, welcome, parse_mode="Markdown")
+            logger.info(f"User {user_id} started bot")
+        
+        # ========== HELP ==========
+        @self.bot.message_handler(commands=['help'])
+        def help_cmd(message):
+            help_text = """
+🤖 *TVA Bot Commands* 🃏
+
+*👥 User Commands:*
+/start - Start bot
+/help - This help
+/profile - Your profile
+/stats - Bot stats
+/id - Your ID
+/ping - Check latency
+/time - Current time
+
+*🛠️ Utilities:*
+/roll [num] - Random number
+/flip - Coin flip
+/joke - Random joke
+/pass [len] - Generate password
+
+*👑 Admin Commands:*
+/admin - Admin panel
+/users - List users
+/ban [id] [reason] - Ban user
+/unban [id] - Unban user
+/warn [id] [reason] - Warn user
+/broadcast [msg] - Broadcast
+
+*🔧 Owner Commands:*
+/restart - Restart bot
+/backup - Backup database
+/clean - Clean database
+            """
+            
+            self.bot.reply_to(message, help_text, parse_mode="Markdown")
+        
+        # ========== PROFILE ==========
+        @self.bot.message_handler(commands=['profile'])
+        def profile_cmd(message):
+            user_id = message.from_user.id
+            user = self.users.get_user(user_id)
+            
+            if not user:
+                self.bot.reply_to(message, "❌ User not found!")
+                return
+            
+            status = "🔴 BANNED" if user[5] else "🟢 ACTIVE"
+            role = "👑 OWNER" if user_id == Config.OWNER_ID else "⭐ ADMIN" if self.admin.is_admin(user_id) else "👤 USER"
+            
+            profile = f"""
+📊 *Your Profile*
+
+*🆔 ID:* `{user[0]}`
+*👤 Username:* @{user[1] or 'N/A'}
+*📛 Name:* {user[2]} {user[3] or ''}
+*📅 Joined:* {user[4]}
+*📨 Messages:* {user[8]}
+*⚠️ Warnings:* {user[7]}/3
+
+*Status:* {status}
+*Role:* {role}
+            """
+            
+            self.bot.reply_to(message, profile, parse_mode="Markdown")
+        
+        # ========== STATS ==========
+        @self.bot.message_handler(commands=['stats'])
+        def stats_cmd(message):
+            total_users = self.users.count()
+            stats = self.db.execute(
+                "SELECT SUM(messages) FROM users",
+                fetchone=True
+            )
+            total_msgs = stats[0] if stats and stats[0] else 0
+            
+            uptime = self.utils.format_time(time.time() - self.start_time)
+            db_size = self.utils.get_file_size(Config.DATABASE_PATH)
+            
+            stats_text = f"""
+📊 *Bot Statistics* 🃏
+
+*👥 Users:* `{total_users}`
+*📨 Messages:* `{total_msgs}`
+*🔴 Banned:* `{len(self.security.banned)}`
+*⏱️ Uptime:* `{uptime}`
+*💾 DB Size:* `{db_size}`
+
+*⚙️ Bot Info:*
+Owner: `{Config.OWNER_ID}`
+Admin: `{Config.ADMIN_ID}`
+            """
+            
+            self.bot.reply_to(message, stats_text, parse_mode="Markdown")
+        
+        # ========== ID ==========
+        @self.bot.message_handler(commands=['id'])
+        def id_cmd(message):
+            user_id = message.from_user.id
+            chat_id = message.chat.id
+            
+            id_text = f"""
+🆔 *ID Information*
+
+*Your ID:* `{user_id}`
+*Chat ID:* `{chat_id}`
+*Username:* @{message.from_user.username or 'N/A'}
+*Name:* {message.from_user.first_name or ''} {message.from_user.last_name or ''}
+            """
+            
+            self.bot.reply_to(message, id_text, parse_mode="Markdown")
+        
+        # ========== PING ==========
+        @self.bot.message_handler(commands=['ping'])
+        def ping_cmd(message):
+            start = time.time()
+            msg = self.bot.reply_to(message, "🏓 Pong!")
+            end = time.time()
+            
+            latency = (end - start) * 1000
+            
+            self.bot.edit_message_text(
+                f"🏓 *Pong!*\n\n"
+                f"⏱️ *Latency:* {latency:.2f} ms\n"
+                f"🕐 *Time:* {datetime.now().strftime('%H:%M:%S')}",
+                chat_id=message.chat.id,
+                message_id=msg.message_id,
+                parse_mode="Markdown"
+            )
+        
+        # ========== TIME ==========
+        @self.bot.message_handler(commands=['time'])
+        def time_cmd(message):
+            current = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            self.bot.reply_to(message, f"🕐 *Time:* `{current}`", parse_mode="Markdown")
+        
+        # ========== ROLL ==========
+        @self.bot.message_handler(commands=['roll'])
+        def roll_cmd(message):
+            try:
+                args = message.text.split()
+                max_num = int(args[1]) if len(args) > 1 else 100
+                result = random.randint(1, max_num)
+                self.bot.reply_to(message, f"🎲 *Roll:* `{result}` (1-{max_num})", parse_mode="Markdown")
+            except:
+                self.bot.reply_to(message, "Usage: /roll [max_number]")
+        
+        # ========== FLIP ==========
+        @self.bot.message_handler(commands=['flip'])
+        def flip_cmd(message):
+            result = random.choice(["HEADS", "TAILS"])
+            self.bot.reply_to(message, f"🪙 *Flip:* `{result}`", parse_mode="Markdown")
+        
+        # ========== JOKE ==========
+        @self.bot.message_handler(commands=['joke'])
+        def joke_cmd(message):
+            jokes = [
+                "Why do programmers prefer dark mode? Because light attracts bugs!",
+                "Why do Java developers wear glasses? Because they don't C#!",
+                "There are 10 types of people in the world: those who understand binary and those who don't.",
+                "Why was the JavaScript developer sad? Because he didn't know how to 'null' his feelings.",
+                "Why do Python programmers wear glasses? Because they can't C!",
+            ]
+            joke = random.choice(jokes)
+            self.bot.reply_to(message, f"😂 *Joke:*\n\n{joke}", parse_mode="Markdown")
+        
+        # ========== PASSWORD ==========
+        @self.bot.message_handler(commands=['pass', 'password'])
+        def password_cmd(message):
+            try:
+                args = message.text.split()
+                length = int(args[1]) if len(args) > 1 else 12
+                length = max(8, min(32, length))
+                
+                chars = string.ascii_letters + string.digits + "!@#$%^&*"
+                password = ''.join(random.choice(chars) for _ in range(length))
+                
+                self.bot.reply_to(message, f"🔐 *Password ({length} chars):*\n`{password}`", parse_mode="Markdown")
+            except:
+                self.bot.reply_to(message, "Usage: /pass [length]")
+        
+        # ========== ADMIN ==========
+        @self.bot.message_handler(commands=['admin'])
+        def admin_cmd(message):
+            user_id = message.from_user.id
+            
+            if not self.admin.is_admin(user_id):
+                self.bot.reply_to(message, "❌ Admin only!")
+                return
+            
+            total_users = self.users.count()
+            
+            admin_text = f"""
+👑 *Admin Panel* 🛡️
+
+*User:* `{user_id}`
+*Role:* {'Owner 👑' if self.admin.is_owner(user_id) else 'Admin ⭐'}
+
+*📊 Stats:*
+Users: `{total_users}`
+Banned: `{len(self.security.banned)}`
+
+*🛠️ Commands:*
+/users - List users
+/ban [id] [reason] - Ban
+/unban [id] - Unban
+/warn [id] [reason] - Warn
+/broadcast [msg] - Broadcast
+
+*⚙️ Controls:*
+/restart - Restart
+/backup - Backup
+/clean - Clean
+            """
+            
+            self.bot.reply_to(message, admin_text, parse_mode="Markdown")
+        
+        # ========== USERS ==========
+        @self.bot.message_handler(commands=['users'])
+        def users_cmd(message):
+            user_id = message.from_user.id
+            
+            if not self.admin.is_admin(user_id):
+                self.bot.reply_to(message, "❌ Admin only!")
+                return
+            
+            all_users = self.users.get_all()
+            
+            if not all_users:
+                self.bot.reply_to(message, "📭 No users")
+                return
+            
+            users_text = f"👥 *Users:* {len(all_users)}\n\n"
+            for idx, user in enumerate(all_users[:15], 1):
+                status = "🔴" if user[4] else "🟢"
+                users_text += f"{idx}. {status} `{user[0]}` - @{user[1] or 'N/A'}\n"
+            
+            if len(all_users) > 15:
+                users_text += f"\n... and {len(all_users) - 15} more"
+            
+            self.bot.reply_to(message, users_text, parse_mode="Markdown")
+        
+        # ========== BAN ==========
+        @self.bot.message_handler(commands=['ban'])
+        def ban_cmd(message):
+            user_id = message.from_user.id
+            
+            if not self.admin.is_admin(user_id):
+                self.bot.reply_to(message, "❌ Admin only!")
+                return
+            
+            args = message.text.split()
+            if len(args) < 2:
+                self.bot.reply_to(message, "Usage: /ban <user_id> [reason]")
+                return
+            
+            try:
+                target_id = int(args[1])
+                reason = " ".join(args[2:]) if len(args) > 2 else "No reason"
+                
+                success, result = self.admin.ban_user(user_id, target_id, reason)
+                
+                if success:
+                    self.security.load_banned()
+                    self.bot.reply_to(message, f"✅ {result}")
+                else:
+                    self.bot.reply_to(message, f"❌ {result}")
+                    
+            except ValueError:
+                self.bot.reply_to(message, "❌ Invalid ID")
+        
+        # ========== BROADCAST ==========
+        @self.bot.message_handler(commands=['broadcast'])
+        def broadcast_cmd(message):
+            user_id = message.from_user.id
+            
+            if not self.admin.is_admin(user_id):
+                self.bot.reply_to(message, "❌ Admin only!")
+                return
+            
+            args = message.text.split(maxsplit=1)
+            if len(args) < 2:
+                self.bot.reply_to(message, "Usage: /broadcast <message>")
+                return
+            
+            msg = args[1]
+            all_users = self.users.get_all()
+            
+            if not all_users:
+                self.bot.reply_to(message, "📭 No users")
+                return
+            
+            progress = self.bot.reply_to(message, "📢 Broadcasting...")
+            
+            success = 0
+            failed = 0
+            
+            for user in all_users[:30]:  # Limit to 30
+                try:
+                    self.bot.send_message(
+                        user[0],
+                        f"📢 *Broadcast*\n\n{msg}\n\n_From admin {user_id}_",
+                        parse_mode="Markdown"
+                    )
+                    success += 1
+                except:
+                    failed += 1
+                
+                time.sleep(0.1)
+            
+            self.bot.edit_message_text(
+                f"✅ *Broadcast Complete*\n\nSuccess: {success}\nFailed: {failed}",
+                chat_id=message.chat.id,
+                message_id=progress.message_id,
+                parse_mode="Markdown"
+            )
+        
+        # ========== BACKUP ==========
+        @self.bot.message_handler(commands=['backup'])
+        def backup_cmd(message):
+            user_id = message.from_user.id
+            
+            if not self.admin.is_owner(user_id):
+                self.bot.reply_to(message, "❌ Owner only!")
+                return
+            
+            backup_file = f"backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
+            
+            try:
+                # Simple backup
+                with open(Config.DATABASE_PATH, 'rb') as src:
+                    with open(backup_file, 'wb') as dst:
+                        dst.write(src.read())
+                
+                size = self.utils.get_file_size(backup_file)
+                self.bot.reply_to(
+                    message, 
+                    f"✅ *Backup created*\n\nFile: `{backup_file}`\nSize: `{size}`",
+                    parse_mode="Markdown"
+                )
+                
+            except Exception as e:
+                self.bot.reply_to(message, f"❌ Backup failed: {e}")
+        
+        # ========== RESTART ==========
+        @self.bot.message_handler(commands=['restart'])
+        def restart_cmd(message):
+            user_id = message.from_user.id
+            
+            if not self.admin.is_owner(user_id):
+                self.bot.reply_to(message, "❌ Owner only!")
+                return
+            
+            self.bot.reply_to(message, "🔄 Restarting...")
+            
+            # Log restart
+            self.admin.log_action(user_id, "RESTART")
+            
+            # Schedule restart
+            threading.Timer(2, self.restart).start()
+        
+        # ========== CLEAN ==========
+        @self.bot.message_handler(commands=['clean'])
+        def clean_cmd(message):
+            user_id = message.from_user.id
+            
+            if not self.admin.is_owner(user_id):
+                self.bot.reply_to(message, "❌ Owner only!")
+                return
+            
+            try:
+                # Clean old rate limits (older than 1 day)
+                self.db.execute(
+                    "DELETE FROM rate_limits WHERE timestamp < ?",
+                    (time.time() - 86400,)
+                )
+                
+                # Clean old logs (older than 7 days)
+                self.db.execute(
+                    "DELETE FROM admin_logs WHERE timestamp < datetime('now', '-7 days')"
+                )
+                
+                self.bot.reply_to(message, "✅ Database cleaned")
+                
+            except Exception as e:
+                self.bot.reply_to(message, f"❌ Clean failed: {e}")
+        
+        # ========== ALL MESSAGES ==========
+        @self.bot.message_handler(func=lambda m: True)
+        def all_messages(message):
+            user_id = message.from_user.id
+            
+            # Security check
+            if self.security.is_banned(user_id):
+                return
+            
+            # Rate limit
+            if not self.security.check_rate(user_id):
+                self.bot.reply_to(message, "⏰ Rate limit!")
+                return
+            
+            # Update stats
+            self.users.update_stats(user_id)
+            
+            # Log commands
+            if message.text and message.text.startswith('/'):
+                logger.info(f"Cmd {user_id}: {message.text[:50]}")
+
+    def restart(self):
+        """Restart bot"""
+        logger.info("🔄 Restarting...")
+        python = sys.executable
+        os.execl(python, python, *sys.argv)
+    
+    def run(self):
+        """Run bot with error handling"""
+        while self.running:
+            try:
+                logger.info("🤖 Bot polling started...")
+                self.bot.polling(none_stop=True, interval=1, timeout=30)
+            except Exception as e:
+                logger.error(f"❌ Polling error: {e}")
+                time.sleep(5)
+
+# ==================== MAIN ====================
+if __name__ == "__main__":
+    # Clear screen
+    os.system('clear' if os.name == 'posix' else 'cls')
+    
+    # Check if telebot is installed
+    try:
+        import telebot
+    except ImportError:
+        print("❌ telebot not installed!")
+        print("Install: pip install pyTelegramBotAPI")
+        sys.exit(1)
+    
+    print("=" * 50)
+    print("🚀 TVA BOT STARTING ON RAILWAY")
+    print("=" * 50)
+    print(f"👑 Owner: {Config.OWNER_ID}")
+    print(f"🤖 Bot Token: {Config.BOT_TOKEN[:15]}...")
+    print(f"💾 Database: {Config.DATABASE_PATH}")
+    print(f"🌐 Web Server: http://{Config.HOST}:{Config.PORT}")
+    print("=" * 50)
+    
+    # Create bot instance
+    global bot_instance
+    bot_instance = TVABot()
+    
+    # Start web server in a separate thread
+    web_thread = threading.Thread(target=run_web_server, daemon=True)
+    web_thread.start()
+    print("✅ Web server started")
+    
+    # Run bot
+    print("✅ Bot ready! Send /start")
+    print("=" * 50)
+    
+    try:
+        bot_instance.run()
+    except KeyboardInterrupt:
+        print("\n👋 Shutting down...")
+        bot_instance.running = False
+        sys.exit(0)

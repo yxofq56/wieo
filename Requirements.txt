@@ -1,0 +1,2 @@
+web: gunicorn info:app
+worker: python info.py
