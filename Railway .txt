@@ -1,0 +1,206 @@
+#!/bin/bash
+
+# TVA Bot - Complete Railway Setup Script
+# Ye script saari required files bana degi
+
+echo "🚀 TVA Bot Railway Setup Starting..."
+echo "====================================="
+
+# 1. Python version file
+echo "📝 Creating .python-version..."
+cat > .python-version << 'EOF'
+3.11.0
+EOF
+echo "✅ .python-version created"
+
+# 2. Requirements file
+echo "📝 Creating requirements.txt..."
+cat > requirements.txt << 'EOF'
+pyTelegramBotAPI==4.12.0
+Flask==2.3.3
+gunicorn==21.2.0
+EOF
+echo "✅ requirements.txt created"
+
+# 3. Railway JSON config
+echo "📝 Creating railway.json..."
+cat > railway.json << 'EOF'
+{
+  "$schema": "https://railway.app/railway.schema.json",
+  "build": {
+    "builder": "NIXPACKS",
+    "buildCommand": "pip install -r requirements.txt"
+  },
+  "deploy": {
+    "startCommand": "./start.sh",
+    "healthcheckPath": "/health",
+    "healthcheckTimeout": 100,
+    "restartPolicyType": "ON_FAILURE",
+    "restartPolicyMaxRetries": 10
+  }
+}
+EOF
+echo "✅ railway.json created"
+
+# 4. Nixpacks config
+echo "📝 Creating nixpacks.toml..."
+cat > nixpacks.toml << 'EOF'
+providers = ["python"]
+
+[phases.setup]
+nixPkgs = ["python311", "gcc", "sqlite"]
+
+[phases.install]
+cmds = ["pip install -r requirements.txt"]
+
+[start]
+cmd = "./start.sh"
+EOF
+echo "✅ nixpacks.toml created"
+
+# 5. Start script
+echo "📝 Creating start.sh..."
+cat > start.sh << 'EOF'
+#!/bin/bash
+
+echo "🚀 Starting TVA Bot on Railway..."
+echo "=================================="
+echo "Python version: $(python --version)"
+echo "Current directory: $(pwd)"
+echo "Files: $(ls -la)"
+
+# Install dependencies
+echo "📦 Installing dependencies..."
+pip install -r requirements.txt
+
+# Check if main script exists
+if [ ! -f "info.py" ]; then
+    echo "❌ info.py not found!"
+    exit 1
+fi
+
+# Start the bot
+echo "✅ Starting bot..."
+echo "=================================="
+python info.py
+EOF
+
+chmod +x start.sh
+echo "✅ start.sh created and made executable"
+
+# 6. Dockerfile
+echo "📝 Creating Dockerfile..."
+cat > Dockerfile << 'EOF'
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    gcc \
+    sqlite3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements first
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application code
+COPY . .
+
+# Make start script executable
+RUN chmod +x start.sh
+
+# Expose port
+EXPOSE 8080
+
+# Run the application
+CMD ["./start.sh"]
+EOF
+echo "✅ Dockerfile created"
+
+# 7. Docker ignore
+echo "📝 Creating .dockerignore..."
+cat > .dockerignore << 'EOF'
+__pycache__
+*.pyc
+*.db
+*.log
+.git
+.env
+.DS_Store
+EOF
+echo "✅ .dockerignore created"
+
+# 8. Git ignore
+echo "📝 Creating .gitignore..."
+cat > .gitignore << 'EOF'
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+
+# Database
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+
+# Logs
+*.log
+bot_logs.log
+
+# Environment
+.env
+.venv
+venv/
+ENV/
+
+# Railway
+.railway/
+tmp/
+
+# Backups
+backup_*.db
+
+# OS
+.DS_Store
+Thumbs.db
+EOF
+echo "✅ .gitignore created"
+
+# 9. Check if info.py exists
+echo "🔍 Checking for info.py..."
+if [ ! -f "info.py" ]; then
+    echo "⚠️  Warning: info.py not found!"
+    echo "Please make sure your bot script is named 'info.py'"
+else
+    echo "✅ info.py found"
+fi
+
+# 10. Make everything executable
+chmod +x start.sh
+chmod +x setup_railway.sh
+
+echo ""
+echo "====================================="
+echo "✅ RAILWAY SETUP COMPLETE!"
+echo "====================================="
+echo ""
+echo "Files created:"
+ls -la | grep -E '(railway|nixpacks|Dockerfile|start|requirements|python-version|git|docker)'
+echo ""
+echo "📦 Next steps:"
+echo "1. Push to GitHub:"
+echo "   git add ."
+echo "   git commit -m 'Railway setup'"
+echo "   git push"
+echo ""
+echo "2. Deploy on Railway:"
+echo "   - Go to https://railway.app"
+echo "   - New Project → Deploy from GitHub"
+echo "   - Select your repository"
+echo ""
+echo "3. Check logs if any issues"
+echo "====================================="
